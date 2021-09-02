@@ -48,13 +48,11 @@ local schema = {
             type = "object",
             properties = {
                 connect = {type = "integer", minValue = 1, default = 2000},
-                read = {type = "integer", minValue = 1, default = 2000},
-                wait = {type = "integer", minValue = 1, default = 60}
+                read = {type = "integer", minValue = 1, default = 2000}
             },
-            default = {connect = 2000, read = 2000, wait = 60}
+            default = {connect = 2000, read = 2000}
         },
-        fetch_interval = {type = "integer", minValue = 1, default = 3},
-        keepalive = {type = "boolean", default = true},
+        fetch_interval = {type = "integer", minValue = 1, default = 30},
 
         -- special the expression used to filter the registered services
         filter = {type = "string"},
@@ -90,23 +88,17 @@ local _M = {version = 0.1}
 
 local function discovery_consul_callback(data, event, source, pid)
     applications = data
-    log.notice("update local variable applications, event is: ", event,
-               "source: ", source, "server pid:", pid, ", applications: ",
-               core.json.encode(applications, true))
+    log.info("update local variable applications, event is: ", event,
+             "source: ", source, "server pid:", pid, ", applications: ",
+             core.json.encode(applications, true))
 end
 
 local function format_consul_params(consul_conf)
     local consul_servers_list = core.table.new(0, #consul_conf.servers)
     local args
 
-    if consul_conf.keepalive == false then
-        args = {recurse = true}
-    elseif consul_conf.keepalive then
-        args = {
-            recurse = true,
-            wait = consul_conf.timeout.wait, -- blocked wait != 0; unblocked by wait = 0
-            index = 0 -- FIXME: may read the index from environment variable: `CONSUL_INDEX`?
-        }
+    if consul_conf.filter and #consul_conf.filter > 0 then
+        args = {filter = consul_conf.filter}
     end
 
     for _, s in ipairs(consul_conf.servers) do
@@ -127,9 +119,7 @@ local function format_consul_params(consul_conf)
             server_name_key = s .. "/v1/agent/",
             consul_service_prefix = "/agent/services",
             weight = consul_conf.weight,
-            keepalive = consul_conf.keepalive,
             default_args = args,
-            index = 0,
             fetch_interval = consul_conf.fetch_interval
         })
     end
@@ -142,30 +132,33 @@ local function update_application(server_name_prefix, data)
     local up_apps = core.table.new(0, #data)
     local weight = default_weight
 
-    for _, service in ipairs(data) do
-        -- insert or replace service
-        sn = service.id or server_name_prefix .. service.service
+    for _, service in pairs(data) do
+        if not service then goto CONTINUE end
+
+        sn = service.Service
         local nodes = up_apps[sn]
         if not nodes then
             nodes = core.table.new(1, 0)
             up_apps[sn] = nodes
         end
 
-        if not service.address or #service.address == 0 then
+        if not service.Address or #service.Address == 0 then
             log.error("no valid service address can be found, service: ",
-                      service.service)
+                      service.ID)
             goto CONTINUE
         end
-        if service.port == 0 then
+        if service.Port == 0 then
             log.error("no valid service port can be found, service: ",
-                      service.port)
+                      service.ID)
             goto CONTINUE
         end
 
+        if service.Weight and service.Weight.Passing and service.Weight.Passing >
+            0 then weight = service.Weight.Passing end
         core.table.insert(nodes, {
-            host = service.address,
-            port = service.port,
-            weight = service.weight and service.weight.passing or weight
+            host = service.Address,
+            port = service.Port,
+            weight = weight
         })
         ::CONTINUE::
     end
@@ -178,7 +171,7 @@ local function update_application(server_name_prefix, data)
     for k, v in pairs(up_apps) do applications[k] = v end
     consul_apps[server_name_prefix] = up_apps
 
-    log.info("update applications: ", core.json.encode(applications))
+    log.info("updated applications: ", core.json.encode(applications))
 end
 
 function _M.connect(premature, consul_server)
@@ -195,7 +188,6 @@ function _M.connect(premature, consul_server)
              json_delay_encode(consul_server, true))
 
     -- query all registered services in consul
-    -- TODO: adding filter parameter for querying services
     local result, err = consul_client:get(consul_server.consul_service_prefix)
     local error_info = (err ~= nil and err) or
                            ((result ~= nil and result.status ~= 200) and
@@ -208,45 +200,31 @@ function _M.connect(premature, consul_server)
         goto ERR
     end
 
-    log.info("connect consul: ", consul_server.server_name_key,
-             ", result status: ", result.status, ", result.headers.index: ",
-             result.headers['X-Consul-Index'], ", result body: ",
-             json_delay_encode(result.body))
+    -- decode body, decode json, update application, error handling
+    if result.body then
+        log.notice("consul server: ", consul_server.server_name_key,
+                   ", header: ", core.json.encode(result.headers, true),
+                   ", body: ", core.json.encode(result.body, true))
 
-    -- if current index different last index then update application
-    if consul_server.index ~= result.headers['X-Consul-Index'] then
-        consul_server.index = result.headers['X-Consul-Index']
-        -- only long connect type use index
-        if consul_server.keepalive then
-            consul_server.default_args.index = result.headers['X-Consul-Index']
+        update_application(consul_server.server_name_key, result.body)
+        -- update events
+        local ok, err = events.post(events_list._source, events_list.updating,
+                                    applications)
+        if not ok then
+            log.error("post_event failure with ", events_list._source,
+                      ", update application error: ", err)
         end
 
-        -- decode body, decode json, update application, error handling
-        if result.body and #result.body ~= 0 then
-            log.notice("consul server: ", consul_server.server_name_key,
-                       ", header: ", core.json.encode(result.headers, true),
-                       ", body: ", core.json.encode(result.body, true))
-
-            -- TODO: write `update_application` function
-            update_application(consul_server.server_name_key, result.body)
-            -- update events
-            local ok, err = events.post(events_list._source,
-                                        events_list.updating, applications)
-            if not ok then
-                log.error("post_event failure with ", events_list._source,
-                          ", update application error: ", err)
-            end
-        end
+        -- terminate this connect life-cycle
+        return
     end
 
     ::ERR::
-    local keepalive = consul_server.keepalive
-    if keepalive then
-        local ok, err = ngx_timer_at(0, _M.connect, consul_server)
-        if not ok then
-            log.error("create ngx_timer_at got error: ", err)
-            return
-        end
+    -- FIXME: use exponential backoff instead of connect immediately
+    local ok, err = ngx_timer_at(0, _M.connect, consul_server)
+    if not ok then
+        log.error("create ngx_timer_at got error: ", err)
+        return
     end
 end
 
@@ -273,16 +251,16 @@ function _M.nodes(service_name)
 end
 
 function _M.init_worker()
-    -- fetch consul registered services and update to applications
+    -- fetch consul registered servers and update to applications
     local consul_conf = local_conf.discovery.consul
-    if not consul_conf or not consul_conf.services or #consul_conf.services == 0 then
-        error("donot  set consul services correctly!")
+    if not consul_conf or not consul_conf.servers or #consul_conf.servers == 0 then
+        error("do not set consul servers correctly!")
         return
     end
 
     local ok, err = core.schema.check(schema, consul_conf)
     if not ok then
-        error("invalid consul configurations:" .. err)
+        error("invalid consul configuration:" .. err)
         return
     end
 
@@ -291,11 +269,13 @@ function _M.init_worker()
                                     "updating")
 
     if 0 ~= ngx.worker.id() then
-        -- register callback function and stop whether is worker process
+        -- register callback function for workers process only
         events.register(discovery_consul_callback, events_list._source,
                         events_list.updating)
         return
     end
+
+    -- TIPS: ONLY THE MASTER PROCESS WILL EXECUTE THE FOLLOWING CODE
 
     log.notice("got consul_conf: ", core.json.encode(consul_conf))
     default_weight = consul_conf.weight
@@ -324,10 +304,7 @@ function _M.init_worker()
             return
         end
 
-        -- refresh services by timer if disable keepalive
-        if server.keepalive == false then
-            ngx_timer_every(server.fetch_interval, _M.connect, server)
-        end
+        ngx_timer_every(server.fetch_interval, _M.connect, server)
     end
 end
 
