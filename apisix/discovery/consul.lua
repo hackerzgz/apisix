@@ -250,6 +250,10 @@ function _M.nodes(service_name)
     return resp_list
 end
 
+function _M.dump_data()
+    return {config = local_conf.discovery.consul, services = applications}
+end
+
 function _M.init_worker()
     -- fetch consul registered servers and update to applications
     local consul_conf = local_conf.discovery.consul
