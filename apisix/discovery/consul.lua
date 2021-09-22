@@ -18,6 +18,7 @@ local require = require
 local local_conf = require("apisix.core.config_local").local_conf()
 local core = require("apisix.core")
 local resty_consul = require('resty.consul')
+local ipmatcher = require("resty.ipmatcher")
 local http = require('resty.http')
 local ipairs = ipairs
 local error = error
@@ -77,8 +78,6 @@ local schema = {
                 }
             }
         }
-
-        -- TODO: add more optional arguments for this module
     },
 
     required = {"servers"}
@@ -116,8 +115,7 @@ local function format_consul_params(consul_conf)
             port = port,
             connect_timeout = consul_conf.timeout.connect,
             read_timeout = consul_conf.timeout.read,
-            server_name_key = s .. "/v1/agent/",
-            consul_service_prefix = "/agent/services",
+            server_name_key = s .. "/v1/agent/services/",
             weight = consul_conf.weight,
             default_args = args,
             fetch_interval = consul_conf.fetch_interval
@@ -135,30 +133,38 @@ local function update_application(server_name_prefix, data)
     for _, service in pairs(data) do
         if not service then goto CONTINUE end
 
-        sn = service.Service
+        sn = server_name_prefix .. service.Service
         local nodes = up_apps[sn]
         if not nodes then
             nodes = core.table.new(1, 0)
             up_apps[sn] = nodes
         end
 
-        if not service.Address or #service.Address == 0 then
-            log.error("no valid service address can be found, service: ",
-                      service.ID)
-            goto CONTINUE
-        end
-        if service.Port == 0 then
-            log.error("no valid service port can be found, service: ",
-                      service.ID)
+	local sid = service.ID
+
+        local host = service.Address
+        if not ipmatcher.parse_ipv4(host) and not ipmatcher.parse_ipv6(host) then
+            log.error("no valid service address can be found, service: ", sid)
             goto CONTINUE
         end
 
-        if service.Weight and service.Weight.Passing and service.Weight.Passing >
-            0 then weight = service.Weight.Passing end
+        local port = service.Port
+        if port <= 0 then
+            log.error("no valid service port can be found, service: ", sid)
+            goto CONTINUE
+        end
+
+        local sw = weight
+        if service.Weight and
+		service.Weight.Passing and
+		service.Weight.Passing > 0
+		then
+		sw = service.Weight.Passing
+	end
         core.table.insert(nodes, {
-            host = service.Address,
-            port = service.Port,
-            weight = weight
+            host = host,
+            port = port,
+            weight = sw
         })
         ::CONTINUE::
     end
@@ -187,14 +193,15 @@ function _M.connect(premature, consul_server)
     log.info("attempts to connect consul_server: ",
              json_delay_encode(consul_server, true))
 
+    local services_api_prefix = "/agent/services"
     -- query all registered services in consul
-    local result, err = consul_client:get(consul_server.consul_service_prefix)
+    local result, err = consul_client:get(services_api_prefix)
     local error_info = (err ~= nil and err) or
                            ((result ~= nil and result.status ~= 200) and
                                result.status)
     if error_info then
         log.error("connect consul: ", consul_server.server_name_key,
-                  " by service prefix: ", consul_server.consul_service_prefix,
+                  " by services prefix: ", consul_server.services_api_prefix,
                   ", got result: ", json_delay_encode(result, true),
                   ", with error: ", error_info)
         goto ERR
@@ -264,7 +271,7 @@ function _M.init_worker()
 
     local ok, err = core.schema.check(schema, consul_conf)
     if not ok then
-        error("invalid consul configuration:" .. err)
+        error("invalid consul configuration: " .. err)
         return
     end
 
@@ -292,15 +299,13 @@ function _M.init_worker()
 
     local consul_servers_list, err = format_consul_params(consul_conf)
     if err then
-        error("failed to format consul server: ", err)
+        error("failed to format consul server: " .. err)
         return
     end
     log.info("consul_servers_list: ", core.json.encode(consul_servers_list))
 
     -- initialize for insert the applications registered to consul
     consul_apps = core.table.new(0, 1)
-
-    -- success or failure
     for _, server in ipairs(consul_servers_list) do
         local ok, err = ngx_timer_at(0, _M.connect, server)
         if not ok then
