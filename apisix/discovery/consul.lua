@@ -17,6 +17,7 @@
 local require = require
 local local_conf = require("apisix.core.config_local").local_conf()
 local core = require("apisix.core")
+local core_sleep = require("apisix.core.utils").sleep
 local resty_consul = require('resty.consul')
 local ipmatcher = require("resty.ipmatcher")
 local http = require('resty.http')
@@ -180,7 +181,7 @@ local function update_application(server_name_prefix, data)
     log.info("updated applications: ", core.json.encode(applications))
 end
 
-function _M.connect(premature, consul_server)
+function _M.connect(premature, consul_server, retry_delay)
     if premature then return end
 
     local consul_client = resty_consul:new({
@@ -204,6 +205,16 @@ function _M.connect(premature, consul_server)
                   " by services prefix: ", consul_server.services_api_prefix,
                   ", got result: ", json_delay_encode(result, true),
                   ", with error: ", error_info)
+
+        if not retry_delay then
+            retry_delay = 1
+        else
+            retry_delay = retry_delay * 4
+        end
+
+        log.warn("retry connecting consul after ", retry_delay, " seconds")
+        core_sleep(retry_delay)
+
         goto ERR
     end
 
@@ -228,7 +239,7 @@ function _M.connect(premature, consul_server)
 
     ::ERR::
     -- FIXME: use exponential backoff instead of connect immediately
-    local ok, err = ngx_timer_at(0, _M.connect, consul_server)
+    local ok, err = ngx_timer_at(0, _M.connect, consul_server, retry_delay)
     if not ok then
         log.error("create ngx_timer_at got error: ", err)
         return

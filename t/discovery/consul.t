@@ -448,3 +448,49 @@ GET /thc
 --- response_body
 [{"healthy_nodes":[{"host":"127.0.0.1","port":30511,"priority":0,"weight":1}],"name":"upstream#/upstreams/1","nodes":[{"host":"127.0.0.1","port":30511,"priority":0,"weight":1},{"host":"127.0.0.2","port":1988,"priority":0,"weight":1}],"src_id":"1","src_type":"upstreams"}]
 {"healthy_nodes":[{"host":"127.0.0.1","port":30511,"priority":0,"weight":1}],"name":"upstream#/upstreams/1","nodes":[{"host":"127.0.0.1","port":30511,"priority":0,"weight":1},{"host":"127.0.0.2","port":1988,"priority":0,"weight":1}],"src_id":"1","src_type":"upstreams"}
+
+
+=== TEST 10: retry when Consul server cannot be reached (long connect type)
+--- yaml_config
+apisix:
+  node_listen: 1984
+  config_center: yaml
+  enable_admin: false
+
+discovery:
+  consul:
+    servers:
+      - "http://127.0.0.1:8501"
+    fetch_interval: 3
+    default_service:
+      host: "127.0.0.1"
+      port: 20999
+#END
+--- apisix_yaml
+router:
+  -
+    url: /*
+    upstream:
+      service_name: http://127.0.0.1:8501/v1/agent/services/webpages
+      discovery_type: consul
+      type: roundrobin
+#END
+--- timeout: 4
+--- config
+location /sleep {
+    content_by_lua_block {
+        local args = ngx.req.get_uri_args()
+	local sec = args.sec or "2"
+	ngx.sleep(tonumber(sec))
+	ngx.say("ok")
+    }
+}
+--- request
+GET /sleep?sec=3
+--- response_body
+ok
+--- grep_error_log eval
+qr/retry connecting consul after \d seconds/
+--- grep_error_log_out
+retry connecting consul after 1 seconds
+retry connecting consul after 4 seconds
